@@ -53,6 +53,10 @@ If running the proxy directly, go to (`http://localhost:11434/config`) and provi
 
 Then in VS Code: **Settings → GitHub Copilot: Local Provider → Ollama** (`localhost:11434`).
 
+### Video walkthrough Connecting to VS Code Copilot
+
+[![Watch how to connect the server to Visual Studio Code](https://img.youtube.com/vi/agnECMF3nVs/hqdefault.jpg)](https://youtu.be/agnECMF3nVs)
+
 ---
 
 ## OPTIONAL: Direct API usage
