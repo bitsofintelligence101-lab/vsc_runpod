@@ -33,6 +33,7 @@ import time
 import queue
 import threading
 import itertools
+import http.client
 import http.server
 import urllib.request
 import urllib.error
@@ -277,7 +278,7 @@ RUNPOD_BASE = _raw_base[:-3].rstrip("/") if _raw_base.endswith("/v1") else _raw_
 RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 
 # Model metadata shown to VS Code. Static config — no server probe.
-MODEL_ALIAS         = os.environ.get("MODEL_ALIAS", "Qwen3.6-27B-uncensored-heretic-v2")
+MODEL_ALIAS         = os.environ.get("MODEL_ALIAS", "Qwen3.6-27B-Q8-heretic-v2")
 DEFAULT_QUANTIZATION = os.environ.get("DEFAULT_QUANTIZATION", "Q8_0")
 MODEL_NAME          = f"{MODEL_ALIAS}:{DEFAULT_QUANTIZATION}"   # Ollama needs 'name:tag'
 CONTEXT_LEN         = int(os.environ.get("LLAMA_CTX", "64000"))
@@ -301,8 +302,16 @@ ENABLE_VISION = os.environ.get("ENABLE_VISION", "true").lower() not in ("0", "fa
 #   DRIP_TOKEN    : the placeholder text. "." by default. Set to "" to drip
 #                   empty (choices-bearing but zero-content) chunks instead —
 #                   no context pollution, if your client tolerates them.
+#TODO: Reconsider this? It doesn't work exactly as intended and letting it fail normally may be better and more consistent with what vs code expects, since it will default to showing a 'try again' message.
 DRIP_INTERVAL = float(os.environ.get("DRIP_INTERVAL", "5"))
 DRIP_TOKEN    = os.environ.get("DRIP_TOKEN", ".")
+
+# --- IncompleteRead retry ---
+# RunPod can close the connection with 0 bytes during a cold start before the
+# worker is ready. Retry up to this many times (with a short backoff) before
+# surfacing the error to VS Code.
+INITIAL_INCOMPLETE_READ_RETRIES = int(os.environ.get("INITIAL_INCOMPLETE_READ_RETRIES", "3"))
+INITIAL_INCOMPLETE_READ_BACKOFF = float(os.environ.get("INITIAL_INCOMPLETE_READ_BACKOFF", "1.5"))
 
 _chunk_id_counter = itertools.count()
 SHUTDOWN_EVENT = threading.Event()
@@ -425,29 +434,50 @@ def forward_stream_to_runpod(path, body, wfile):
     stop = threading.Event()
 
     def reader():
-        req = urllib.request.Request(url, data=data, headers=_runpod_headers(), method="POST")
-        tracked_resp = None
-        try:
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-                tracked_resp = resp
-                _track_upstream(resp)
-                while not stop.is_set():
-                    if SHUTDOWN_EVENT.is_set():
-                        break
-                    chunk = resp.read(4096)
-                    if not chunk:
-                        break
-                    q.put(("bytes", chunk))
-        except urllib.error.HTTPError as e:
-            if not SHUTDOWN_EVENT.is_set():
-                q.put(("error", f"HTTP {e.code}: {e.read().decode(errors='ignore')[:500]}"))
-        except Exception as e:  # noqa: BLE001 — surface any upstream failure to the client
-            if not SHUTDOWN_EVENT.is_set():
-                q.put(("error", str(e)))
-        finally:
-            if tracked_resp is not None:
-                _untrack_upstream(tracked_resp)
-            q.put(("done", None))
+        attempts_left = INITIAL_INCOMPLETE_READ_RETRIES + 1
+        while attempts_left > 0 and not SHUTDOWN_EVENT.is_set() and not stop.is_set():
+            attempts_left -= 1
+            req = urllib.request.Request(url, data=data, headers=_runpod_headers(), method="POST")
+            tracked_resp = None
+            retry = False
+            try:
+                with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                    tracked_resp = resp
+                    _track_upstream(resp)
+                    while not stop.is_set():
+                        if SHUTDOWN_EVENT.is_set():
+                            break
+                        chunk = resp.read(4096)
+                        if not chunk:
+                            break
+                        q.put(("bytes", chunk))
+            except http.client.IncompleteRead as e:
+                partial = getattr(e, "partial", b"") or b""
+                if not partial and attempts_left > 0 and not SHUTDOWN_EVENT.is_set():
+                    print(f"[proxy] IncompleteRead(0 bytes), retrying "
+                          f"({INITIAL_INCOMPLETE_READ_RETRIES - attempts_left + 1}/"
+                          f"{INITIAL_INCOMPLETE_READ_RETRIES})"
+                          f" in {INITIAL_INCOMPLETE_READ_BACKOFF}s")
+                    retry = True
+                elif not SHUTDOWN_EVENT.is_set():
+                    q.put(("error", str(e)))
+            except urllib.error.HTTPError as e:
+                if not SHUTDOWN_EVENT.is_set():
+                    q.put(("error", f"HTTP {e.code}: {e.read().decode(errors='ignore')[:500]}"))
+            except Exception as e:  # noqa: BLE001 — surface any upstream failure to the client
+                if not SHUTDOWN_EVENT.is_set():
+                    q.put(("error", str(e)))
+            finally:
+                if tracked_resp is not None:
+                    _untrack_upstream(tracked_resp)
+                if not retry:
+                    q.put(("done", None))
+                    return
+            # retry path — sleep outside finally so done isn't put prematurely
+            time.sleep(INITIAL_INCOMPLETE_READ_BACKOFF)
+        # Safety net: if the while loop exits because SHUTDOWN_EVENT / stop was set
+        # between retry iterations, make sure the main thread can unblock.
+        q.put(("done", None))
 
     threading.Thread(target=reader, daemon=True).start()
 
@@ -492,7 +522,7 @@ def forward_stream_to_runpod(path, body, wfile):
                     return
             elif kind == "error":
                 if not real_started:
-                    msg = f"[proxy: upstream error] {payload}"
+                    msg = f"[proxy: upstream error] {payload} \n The runpod worker likely failed to start. This can happen if the model files fail to load or if the worker runs out of memory. You can check your RunPod endpoint's logs for more details. If this happens consistently, consider trying a smaller model or checking your RunPod resource limits. Large context window is usually the issue, stay under 64k unless you're using the 80gb+ GPUs\n\nOr just start a new chat and retry if this was your first request or it's been awhile"
                     safe_write(_sse(_chunk(model, cid, delta={"content": msg})))
                     safe_write(_sse(_chunk(model, cid, finish="stop")))
                 print(f"[proxy] <- RunPod error: {payload}")
@@ -761,9 +791,11 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
                     "model": model_name,
                     "messages": parsed.get("messages", []),
                     "stream": is_stream,
-                    "temperature": opts.get("temperature"),
-                    "top_p": opts.get("top_p"),
                 }
+                if opts.get("temperature") is not None:
+                    llama_body["temperature"] = opts["temperature"]
+                if opts.get("top_p") is not None:
+                    llama_body["top_p"] = opts["top_p"]
                 if is_stream:
                     self._start_sse()
                     forward_stream_to_runpod("/v1/chat/completions", llama_body, self.wfile)
@@ -831,7 +863,7 @@ if __name__ == "__main__":
     server = http.server.ThreadingHTTPServer(("0.0.0.0", PROXY_PORT), OllamaProxyHandler)
     server.daemon_threads = True
 
-    print("=" * 60)
+    print("\n", "=" * 60)
     print("Ollama <-> RunPod Serverless proxy")
     print("=" * 60)
     if not is_config_ready():
@@ -856,6 +888,9 @@ if __name__ == "__main__":
     print("  Only /api/chat, /api/generate, /v1/chat/completions, /v1/responses")
     print("  are forwarded to RunPod.")
     print("=" * 60)
+    print("NOTE on first deployment or deployment after a long idle period:")
+    print("If you have just deployed the model on runpod, you need to wait about 10 minutes for the first cold start")
+    print("if you get error in visual studo code like \n'............[proxy: upstream error] IncompleteRead(0 bytes read)'\n it's not ready yet, wait and try again in about 5 minutes\nthe server is still probably downloading the large model files")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
