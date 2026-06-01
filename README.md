@@ -59,6 +59,14 @@ Then in VS Code: **Settings → GitHub Copilot: Local Provider → Ollama** (`lo
 
 ---
 
+## OPTIONAL: Browser Chat UI
+
+Open `chat.html` directly in your browser (no server needed). Enter your RunPod API key and Endpoint ID in the config bar at the top and click **Save**. Supports streaming text and image attachments (vision). Your config is persisted in `localStorage` between sessions.
+
+The chat UI calls `https://api.runpod.ai/v2/<ENDPOINT_ID>/openai/v1/chat/completions` directly from the browser — no proxy required.
+
+---
+
 ## OPTIONAL: Direct API usage
 
 ```python

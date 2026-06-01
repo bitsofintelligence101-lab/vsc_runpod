@@ -35,6 +35,7 @@ import threading
 import itertools
 import http.client
 import http.server
+import socket
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -262,6 +263,41 @@ def send_html(handler, html, status=200):
     handler.wfile.write(body)
 
 
+def _chat_page_html():
+    """Serve chat.html with server config pre-injected into localStorage."""
+    chat_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat.html")
+    try:
+        with open(chat_file, "r", encoding="utf-8") as f:
+            html = f.read()
+    except FileNotFoundError:
+        return "<h1>chat.html not found</h1><p>Make sure chat.html is in the same directory as the proxy.</p>"
+
+    endpoint_id = endpoint_id_from_base_or_endpoint(RUNPOD_BASE)
+    model_alias = MODEL_ALIAS  # without quant suffix — matches chat.html placeholder
+
+    # Inject a script that seeds localStorage only when the user has no saved config yet.
+    # This way returning users keep their existing settings.
+    inject = f"""<script>
+(function() {{
+  try {{
+    var saved = JSON.parse(localStorage.getItem("runpod_chat_cfg") || "{{}}");
+    if (!saved.apiKey && !saved.endpointId) {{
+      localStorage.setItem("runpod_chat_cfg", JSON.stringify({{
+        apiKey: {json.dumps(RUNPOD_API_KEY)},
+        endpointId: {json.dumps(endpoint_id)},
+        modelName: {json.dumps(model_alias)},
+        temperature: 0.7,
+        maxTokens: 2048
+      }}));
+    }}
+  }} catch(e) {{}}
+}})();
+</script>"""
+
+    # Insert just before </head> so it runs before loadConfig()
+    return html.replace("</head>", inject + "\n</head>", 1)
+
+
 load_dotenv_file()
 
 # --- Configuration (env-overridable) ---
@@ -312,6 +348,12 @@ DRIP_TOKEN    = os.environ.get("DRIP_TOKEN", ".")
 # surfacing the error to VS Code.
 INITIAL_INCOMPLETE_READ_RETRIES = int(os.environ.get("INITIAL_INCOMPLETE_READ_RETRIES", "3"))
 INITIAL_INCOMPLETE_READ_BACKOFF = float(os.environ.get("INITIAL_INCOMPLETE_READ_BACKOFF", "1.5"))
+
+# --- First-byte timeout / queue purge ---
+# If RunPod accepts the request but produces no stream bytes for this long,
+# purge the queue and retry instead of letting orphaned jobs pile up.
+FIRST_BYTE_TIMEOUT = float(os.environ.get("FIRST_BYTE_TIMEOUT", "20"))
+QUEUE_PURGE_TIMEOUT = float(os.environ.get("QUEUE_PURGE_TIMEOUT", "10"))
 
 _chunk_id_counter = itertools.count()
 SHUTDOWN_EVENT = threading.Event()
@@ -376,6 +418,33 @@ def _runpod_headers():
     return h
 
 
+def _runpod_control_base():
+    endpoint_id = endpoint_id_from_base_or_endpoint(RUNPOD_BASE)
+    if not endpoint_id:
+        return ""
+    return f"https://api.runpod.ai/v2/{endpoint_id}"
+
+
+def purge_runpod_queue(reason="timeout"):
+    """Best-effort full queue clear for the active RunPod endpoint."""
+    control_base = _runpod_control_base()
+    if not control_base:
+        print(f"[proxy] queue purge skipped ({reason}): endpoint id unavailable")
+        return False
+
+    url = f"{control_base}/purge-queue"
+    req = urllib.request.Request(url, data=b"{}", headers=_runpod_headers(), method="POST")
+    print(f"[proxy] -> RunPod POST {url}  (purge queue, reason={reason})")
+    try:
+        with urllib.request.urlopen(req, timeout=QUEUE_PURGE_TIMEOUT) as resp:
+            body = resp.read().decode(errors="ignore")
+            print(f"[proxy] <- RunPod {resp.status}  purge response: {body[:300]}")
+            return True
+    except Exception as e:  # noqa: BLE001 - queue purge is best effort
+        print(f"[proxy] queue purge failed ({reason}): {e}")
+        return False
+
+
 def forward_to_runpod(path, body):
     """Non-streaming POST to RunPod's OpenAI endpoint -> (status_code, response_text)."""
     url = f"{RUNPOD_BASE}{path}"
@@ -412,34 +481,23 @@ def _chunk(model, cid, delta=None, finish=None):
 
 def forward_stream_to_runpod(path, body, wfile):
     """
-    Stream from RunPod's OpenAI endpoint to the client, with a cold-start
-    keepalive drip.
+    Stream from RunPod's OpenAI endpoint to the client.
 
-    A background thread connects to RunPod (which may block for the whole cold
-    start before any byte arrives). Meanwhile this thread:
-      1. sends an immediate role chunk so 'choices' exist right away,
-      2. drips a placeholder token every DRIP_INTERVAL seconds *until* the first
-         real byte arrives (safe: nothing partial has been written yet),
-      3. once real bytes flow, forwards RunPod's raw SSE verbatim and NEVER
-         injects again (injecting mid-event would corrupt the stream).
+    If the upstream request produces no bytes within FIRST_BYTE_TIMEOUT seconds,
+    purge the RunPod queue, retry, and do that up to
+    INITIAL_INCOMPLETE_READ_RETRIES times before surfacing failure.
     """
     url = f"{RUNPOD_BASE}{path}"
     data = json.dumps(body).encode()
     model = body.get("model", MODEL_NAME)
     cid = f"chatcmpl-proxy-{next(_chunk_id_counter)}"
-    print(f"[proxy] -> RunPod POST {url}  (streaming, drip every {DRIP_INTERVAL}s)")
+    print(f"[proxy] -> RunPod POST {url}  (streaming, first-byte timeout {FIRST_BYTE_TIMEOUT}s)")
     print(f"[proxy]    body: {json.dumps(body)[:300]}")
 
-    q = queue.Queue()
-    stop = threading.Event()
-
-    def reader():
-        attempts_left = INITIAL_INCOMPLETE_READ_RETRIES + 1
-        while attempts_left > 0 and not SHUTDOWN_EVENT.is_set() and not stop.is_set():
-            attempts_left -= 1
+    def start_reader(q, stop):
+        def reader():
             req = urllib.request.Request(url, data=data, headers=_runpod_headers(), method="POST")
             tracked_resp = None
-            retry = False
             try:
                 with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
                     tracked_resp = resp
@@ -453,33 +511,28 @@ def forward_stream_to_runpod(path, body, wfile):
                         q.put(("bytes", chunk))
             except http.client.IncompleteRead as e:
                 partial = getattr(e, "partial", b"") or b""
-                if not partial and attempts_left > 0 and not SHUTDOWN_EVENT.is_set():
-                    print(f"[proxy] IncompleteRead(0 bytes), retrying "
-                          f"({INITIAL_INCOMPLETE_READ_RETRIES - attempts_left + 1}/"
-                          f"{INITIAL_INCOMPLETE_READ_RETRIES})"
-                          f" in {INITIAL_INCOMPLETE_READ_BACKOFF}s")
-                    retry = True
+                if partial:
+                    q.put(("bytes", partial))
                 elif not SHUTDOWN_EVENT.is_set():
                     q.put(("error", str(e)))
             except urllib.error.HTTPError as e:
                 if not SHUTDOWN_EVENT.is_set():
                     q.put(("error", f"HTTP {e.code}: {e.read().decode(errors='ignore')[:500]}"))
+            except (socket.timeout, TimeoutError, urllib.error.URLError) as e:
+                if not SHUTDOWN_EVENT.is_set():
+                    q.put(("timeout", str(e)))
             except Exception as e:  # noqa: BLE001 — surface any upstream failure to the client
                 if not SHUTDOWN_EVENT.is_set():
                     q.put(("error", str(e)))
             finally:
                 if tracked_resp is not None:
                     _untrack_upstream(tracked_resp)
-                if not retry:
+                if not stop.is_set():
                     q.put(("done", None))
-                    return
-            # retry path — sleep outside finally so done isn't put prematurely
-            time.sleep(INITIAL_INCOMPLETE_READ_BACKOFF)
-        # Safety net: if the while loop exits because SHUTDOWN_EVENT / stop was set
-        # between retry iterations, make sure the main thread can unblock.
-        q.put(("done", None))
 
-    threading.Thread(target=reader, daemon=True).start()
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        return thread
 
     def safe_write(b):
         try:
@@ -487,54 +540,93 @@ def forward_stream_to_runpod(path, body, wfile):
             wfile.flush()
             return True
         except (BrokenPipeError, ConnectionResetError, OSError):
-            stop.set()
+            stream_stop.set()
             return False
+
+    def stop_current_attempt(stop):
+        stop.set()
+        _close_active_upstreams()
+
+    def failure_reason(kind, payload):
+        if kind == "timeout":
+            return f"no upstream bytes within {FIRST_BYTE_TIMEOUT}s"
+        if kind == "done":
+            return "upstream closed before sending any bytes"
+        return payload
 
     # 1. immediate role chunk -> client sees 'choices' instantly
     if not safe_write(_sse(_chunk(model, cid, delta={"role": "assistant", "content": ""}))):
         return
 
+    stream_stop = threading.Event()
     real_started = False
-    drips = 0
+    final_error = ""
     try:
-        while True:
+        for attempt_index in range(1, INITIAL_INCOMPLETE_READ_RETRIES + 1):
             if SHUTDOWN_EVENT.is_set():
                 break
 
-            if real_started:
-                kind, payload = q.get()                 # pump raw bytes, no injection
-            else:
-                try:
-                    kind, payload = q.get(timeout=DRIP_INTERVAL)
-                except queue.Empty:
-                    # still cold — drip a placeholder to reset the client's timer
-                    delta = {"content": DRIP_TOKEN} if DRIP_TOKEN else {"content": ""}
-                    if not safe_write(_sse(_chunk(model, cid, delta=delta))):
-                        return
-                    drips += 1
-                    continue
+            q = queue.Queue()
+            attempt_stop = threading.Event()
+            start_reader(q, attempt_stop)
+            first_byte_seen = False
 
-            if kind == "bytes":
-                if not real_started:
-                    real_started = True
-                    print(f"[proxy] first real bytes after {drips} drip(s); piping raw SSE")
-                if not safe_write(payload):
-                    return
-            elif kind == "error":
-                if not real_started:
-                    msg = f"[proxy: upstream error] {payload} \n The runpod worker likely failed to start. This can happen if the model files fail to load or if the worker runs out of memory. You can check your RunPod endpoint's logs for more details. If this happens consistently, consider trying a smaller model or checking your RunPod resource limits. Large context window is usually the issue, stay under 64k unless you're using the 80gb+ GPUs\n\nOr just start a new chat and retry if this was your first request or it's been awhile"
-                    safe_write(_sse(_chunk(model, cid, delta={"content": msg})))
-                    safe_write(_sse(_chunk(model, cid, finish="stop")))
-                print(f"[proxy] <- RunPod error: {payload}")
+            while True:
+                if SHUTDOWN_EVENT.is_set() or attempt_stop.is_set() or stream_stop.is_set():
+                    break
+
+                if not first_byte_seen:
+                    try:
+                        kind, payload = q.get(timeout=FIRST_BYTE_TIMEOUT)
+                    except queue.Empty:
+                        kind, payload = "timeout", ""
+
+                    if kind == "bytes":
+                        first_byte_seen = True
+                        real_started = True
+                        print(f"[proxy] first real bytes on attempt {attempt_index}/{INITIAL_INCOMPLETE_READ_RETRIES}")
+                        if not safe_write(payload):
+                            return
+                        continue
+
+                    reason = failure_reason(kind, payload)
+                    if attempt_index < INITIAL_INCOMPLETE_READ_RETRIES:
+                        print(f"[proxy] first-byte wait failed on attempt {attempt_index}/{INITIAL_INCOMPLETE_READ_RETRIES}: {reason}")
+                        stop_current_attempt(attempt_stop)
+                        purge_runpod_queue(reason=reason)
+                        time.sleep(INITIAL_INCOMPLETE_READ_BACKOFF)
+                        break
+
+                    final_error = reason
+                    print(f"[proxy] first-byte wait failed after {attempt_index} attempt(s): {reason}")
+                    stop_current_attempt(attempt_stop)
+                    break
+
+                kind, payload = q.get()
+                if kind == "bytes":
+                    if not safe_write(payload):
+                        return
+                elif kind == "error":
+                    print(f"[proxy] <- RunPod error after stream start: {payload}")
+                    break
+                elif kind == "timeout":
+                    print(f"[proxy] <- RunPod timeout after stream start: {payload}")
+                    break
+                elif kind == "done":
+                    break
+
+            if first_byte_seen:
                 break
-            elif kind == "done":
-                break
+
+        if final_error and not real_started:
+            print(f"[proxy] stream failed before first byte: {final_error}")
     finally:
-        stop.set()
+        stream_stop.set()
+        _close_active_upstreams()
         # Always terminate the SSE stream. If RunPod already sent [DONE] in the
         # raw bytes, a second one is harmless (clients stop at the first).
         safe_write(b"data: [DONE]\n\n")
-        print(f"[proxy] <- stream closed (real_started={real_started}, drips={drips})")
+        print(f"[proxy] <- stream closed (real_started={real_started})")
 
 
 def responses_to_chat_completions(parsed):
@@ -607,6 +699,10 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
             send_html(self, config_page_html())
             return
 
+        if self.path == "/chat":
+            send_html(self, _chat_page_html())
+            return
+
         if not is_config_ready():
             self.send_json(503, {
                 "error": "Proxy not configured yet. Open /config and set RUNPOD_API_KEY and endpoint.",
@@ -629,7 +725,7 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
                     "name": model_name,
                     "model": model_name,
                     "modified_at": datetime.utcnow().isoformat() + "Z",
-                    "size": 22000000000,
+                    "size": 27000000000,
                     "digest": "aaaaaaaaaaaaaaaa",
                     "details": {
                         "parent_model": "", "format": "gguf",
@@ -878,6 +974,7 @@ if __name__ == "__main__":
     print(f"  Listening (as Ollama):  http://0.0.0.0:{PROXY_PORT}")
     print(f"  Forwarding to RunPod:    {RUNPOD_BASE}/v1/...")
     print(f"  Auth header:             {'set' if RUNPOD_API_KEY else 'MISSING — set RUNPOD_API_KEY!'}")
+    print(f"  Browser chat UI:         http://localhost:{PROXY_PORT}/chat")
     print(f"  Advertised model:        {MODEL_NAME}  (context {CONTEXT_LEN})")
     print(f"  Vision capability:       {'enabled' if ENABLE_VISION else 'disabled'}")
     print(f"  Cold-start drip:         '{DRIP_TOKEN}' every {DRIP_INTERVAL}s until real tokens")
