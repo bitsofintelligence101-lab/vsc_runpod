@@ -141,10 +141,12 @@ def is_config_ready():
     return True
 
 
-def apply_runtime_config(api_key, endpoint_or_base):
-    global RUNPOD_API_KEY, RUNPOD_BASE
+def apply_runtime_config(api_key, endpoint_or_base, enable_vision=None):
+    global RUNPOD_API_KEY, RUNPOD_BASE, ENABLE_VISION
     RUNPOD_API_KEY = (api_key or "").strip()
     RUNPOD_BASE = normalize_runpod_base(endpoint_or_base)
+    if enable_vision is not None:
+        ENABLE_VISION = enable_vision
 
 
 def current_endpoint_display():
@@ -172,6 +174,7 @@ def config_page_html(message="", error=False):
     request_timeout_value = "" if REQUEST_TIMEOUT is None else str(REQUEST_TIMEOUT)
     drip_interval_value = str(DRIP_INTERVAL)
     drip_token_value = DRIP_TOKEN.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+    vision_checked = "checked" if ENABLE_VISION else ""
 
     return f"""<!doctype html>
 <html lang=\"en\">
@@ -234,7 +237,11 @@ def config_page_html(message="", error=False):
                 <label for=\"drip_token\">DRIP_TOKEN</label>
                 <input id=\"drip_token\" name=\"drip_token\" value=\"{drip_token_value}\" placeholder=\".\" />
                 <div class=\"hint\">Placeholder token emitted while waiting for the first real streamed bytes.</div>
-
+                <label style="display:flex;align-items:center;gap:8px;font-weight:600;font-size:14px;margin-top:14px">
+                  <input id="enable_vision" name="enable_vision" type="checkbox" {vision_checked} style="width:auto" />
+                  Enable Vision (advertise model as multimodal)
+                </label>
+                <div class="hint">Adds <code>&quot;vision&quot;</code> capability so VS Code Copilot shows this model for image inputs.</div>
         <button type=\"submit\">Save Configuration</button>
       </form>
       <div class=\"hint\" style=\"margin-top:16px\">Then use VS Code Copilot local Ollama at <code>http://localhost:{PROXY_PORT}</code>.</div>
@@ -279,6 +286,10 @@ CONTEXT_LEN         = int(os.environ.get("LLAMA_CTX", "64000"))
 # load) that takes a while. Set REQUEST_TIMEOUT (seconds) to cap it if you prefer.
 _t = os.environ.get("REQUEST_TIMEOUT")
 REQUEST_TIMEOUT = int(_t) if _t else None
+
+# Vision capability — advertise the model as multimodal so VS Code Copilot
+# surfaces it as a vision model in addition to a tool model.
+ENABLE_VISION = os.environ.get("ENABLE_VISION", "true").lower() not in ("0", "false", "no")
 
 # --- Cold-start keepalive ("drip") ---
 # While RunPod spins up a worker (model load can take much longer than the
@@ -580,6 +591,9 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"version": "0.6.4"})
 
         elif self.path == "/api/tags":
+            families = ["qwen36"]
+            if ENABLE_VISION:
+                families.append("clip")
             self.send_json(200, {
                 "models": [{
                     "name": model_name,
@@ -589,7 +603,7 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
                     "digest": "aaaaaaaaaaaaaaaa",
                     "details": {
                         "parent_model": "", "format": "gguf",
-                        "family": "qwen36", "families": ["qwen36"],
+                        "family": "qwen36", "families": families,
                         "parameter_size": "27B", "quantization_level": quant,
                     },
                 }]
@@ -629,6 +643,7 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
             request_timeout = (fields.get("request_timeout", [""])[0] or "").strip()
             drip_interval = (fields.get("drip_interval", [""])[0] or str(DRIP_INTERVAL)).strip()
             drip_token = fields.get("drip_token", [DRIP_TOKEN])[0]
+            enable_vision = "enable_vision" in fields
 
             if not api_key and not RUNPOD_API_KEY:
                 send_html(self, config_page_html("API key is required.", error=True), status=400)
@@ -679,6 +694,7 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
                 "LLAMA_CTX": llama_ctx,
                 "DRIP_INTERVAL": drip_interval,
                 "DRIP_TOKEN": drip_token,
+                "ENABLE_VISION": "true" if enable_vision else "false",
             }
             if request_timeout:
                 updates["REQUEST_TIMEOUT"] = request_timeout
@@ -691,7 +707,7 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
                 send_html(self, config_page_html(f"Failed writing .env: {e}", error=True), status=500)
                 return
 
-            apply_runtime_config(final_key, final_endpoint)
+            apply_runtime_config(final_key, final_endpoint, enable_vision=enable_vision)
             print("[proxy] configuration saved to .env")
             if is_config_ready():
                 print("[proxy] server is ready to use with Visual Studio Code")
@@ -713,6 +729,11 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
 
             # --- /api/show --- answered locally (metadata only)
             if self.path == "/api/show":
+                families = ["qwen36"]
+                capabilities = ["completion", "tools"]
+                if ENABLE_VISION:
+                    families.append("clip")
+                    capabilities.append("vision")
                 self.send_json(200, {
                     "model": model_name,
                     "modelfile": f"FROM {model_name}",
@@ -720,7 +741,7 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
                     "template": "{{ .Prompt }}",
                     "details": {
                         "parent_model": "", "format": "gguf",
-                        "family": "qwen36", "families": ["qwen36"],
+                        "family": "qwen36", "families": families,
                         "parameter_size": "27B", "quantization_level": quant,
                     },
                     "model_info": {
@@ -730,7 +751,7 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
                         "qwen36.context_length": ctx_len,
                         "qwen36.attention.head_count": 32,
                     },
-                    "capabilities": ["completion", "tools"],
+                    "capabilities": capabilities,
                 })
 
             # --- /api/chat -> /v1/chat/completions (Ollama native chat path) ---
@@ -826,6 +847,7 @@ if __name__ == "__main__":
     print(f"  Forwarding to RunPod:    {RUNPOD_BASE}/v1/...")
     print(f"  Auth header:             {'set' if RUNPOD_API_KEY else 'MISSING — set RUNPOD_API_KEY!'}")
     print(f"  Advertised model:        {MODEL_NAME}  (context {CONTEXT_LEN})")
+    print(f"  Vision capability:       {'enabled' if ENABLE_VISION else 'disabled'}")
     print(f"  Cold-start drip:         '{DRIP_TOKEN}' every {DRIP_INTERVAL}s until real tokens")
     
     print()
