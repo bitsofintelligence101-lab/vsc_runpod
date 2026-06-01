@@ -1,5 +1,9 @@
 # llama.cpp · RunPod Serverless
 
+## How To Video
+
+[![Watch the how to video](https://img.youtube.com/vi/cbYriUCPS4A/maxresdefault.jpg)](https://youtu.be/cbYriUCPS4A)
+
 Run a RunPod Hosted Model and use it as a local Ollama provider in VS Code Copilot.
 
 currently hardcoded to the Q8 version of Qwen3.6-27B-uncensored-heretic-v2 model, but you can modify the dockerfile and proxy script to use any model you like (see make_your_own/README.md).
