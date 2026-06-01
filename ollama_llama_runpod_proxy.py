@@ -166,6 +166,12 @@ def config_page_html(message="", error=False):
 
     endpoint_value = current_endpoint_display().replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
     masked_key = RUNPOD_API_KEY[:6] + ("..." if RUNPOD_API_KEY else "")
+    model_alias_value = MODEL_ALIAS.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+    quant_value = DEFAULT_QUANTIZATION.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+    context_value = str(CONTEXT_LEN)
+    request_timeout_value = "" if REQUEST_TIMEOUT is None else str(REQUEST_TIMEOUT)
+    drip_interval_value = str(DRIP_INTERVAL)
+    drip_token_value = DRIP_TOKEN.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
 
     return f"""<!doctype html>
 <html lang=\"en\">
@@ -204,6 +210,30 @@ def config_page_html(message="", error=False):
         <label for=\"runpod_endpoint\">RunPod Endpoint ID or OpenAI Base URL</label>
         <input id=\"runpod_endpoint\" name=\"runpod_endpoint\" value=\"{endpoint_value}\" placeholder=\"4zymmya1e6kh25 or https://api.runpod.ai/v2/.../openai/v1\" />
         <div class=\"hint\">Examples: <code>4zymmya1e6kh25</code> or full URL.</div>
+
+                <label for=\"model_alias\">Model Alias</label>
+                <input id=\"model_alias\" name=\"model_alias\" value=\"{model_alias_value}\" placeholder=\"Qwen3.6-27B-uncensored-heretic-v2\" />
+                <div class=\"hint\">Advertised model name before the quantization suffix is appended.</div>
+
+                <label for=\"default_quantization\">Default Quantization</label>
+                <input id=\"default_quantization\" name=\"default_quantization\" value=\"{quant_value}\" placeholder=\"Q8_0\" />
+                <div class=\"hint\">Combined with the model alias to form the Ollama-visible model tag.</div>
+
+                <label for=\"llama_ctx\">LLAMA_CTX</label>
+                <input id=\"llama_ctx\" name=\"llama_ctx\" value=\"{context_value}\" placeholder=\"64000\" />
+                <div class=\"hint\">Context length advertised in local metadata responses.</div>
+
+                <label for=\"request_timeout\">REQUEST_TIMEOUT</label>
+                <input id=\"request_timeout\" name=\"request_timeout\" value=\"{request_timeout_value}\" placeholder=\"leave blank for no timeout\" />
+                <div class=\"hint\">Optional upstream timeout in seconds. Leave blank to allow long cold starts.</div>
+
+                <label for=\"drip_interval\">DRIP_INTERVAL</label>
+                <input id=\"drip_interval\" name=\"drip_interval\" value=\"{drip_interval_value}\" placeholder=\"5\" />
+                <div class=\"hint\">Seconds between keepalive drip chunks during cold start.</div>
+
+                <label for=\"drip_token\">DRIP_TOKEN</label>
+                <input id=\"drip_token\" name=\"drip_token\" value=\"{drip_token_value}\" placeholder=\".\" />
+                <div class=\"hint\">Placeholder token emitted while waiting for the first real streamed bytes.</div>
 
         <button type=\"submit\">Save Configuration</button>
       </form>
@@ -593,12 +623,43 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
 
             api_key = (fields.get("api_key", [""])[0] or "").strip()
             endpoint = (fields.get("runpod_endpoint", [""])[0] or "").strip()
+            model_alias = (fields.get("model_alias", [""])[0] or MODEL_ALIAS).strip()
+            default_quantization = (fields.get("default_quantization", [""])[0] or DEFAULT_QUANTIZATION).strip()
+            llama_ctx = (fields.get("llama_ctx", [""])[0] or str(CONTEXT_LEN)).strip()
+            request_timeout = (fields.get("request_timeout", [""])[0] or "").strip()
+            drip_interval = (fields.get("drip_interval", [""])[0] or str(DRIP_INTERVAL)).strip()
+            drip_token = fields.get("drip_token", [DRIP_TOKEN])[0]
 
             if not api_key and not RUNPOD_API_KEY:
                 send_html(self, config_page_html("API key is required.", error=True), status=400)
                 return
             if not endpoint and not RUNPOD_BASE:
                 send_html(self, config_page_html("RunPod endpoint is required.", error=True), status=400)
+                return
+            if not model_alias:
+                send_html(self, config_page_html("Model alias is required.", error=True), status=400)
+                return
+            if not default_quantization:
+                send_html(self, config_page_html("Default quantization is required.", error=True), status=400)
+                return
+
+            try:
+                int(llama_ctx)
+            except ValueError:
+                send_html(self, config_page_html("LLAMA_CTX must be an integer.", error=True), status=400)
+                return
+
+            if request_timeout:
+                try:
+                    int(request_timeout)
+                except ValueError:
+                    send_html(self, config_page_html("REQUEST_TIMEOUT must be an integer when set.", error=True), status=400)
+                    return
+
+            try:
+                float(drip_interval)
+            except ValueError:
+                send_html(self, config_page_html("DRIP_INTERVAL must be a number.", error=True), status=400)
                 return
 
             final_key = api_key or RUNPOD_API_KEY
@@ -613,7 +674,14 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
             updates = {
                 "RUNPOD_API_KEY": final_key,
                 "RUNPOD_OPENAI_BASE": f"{final_base}/v1",
+                "MODEL_ALIAS": model_alias,
+                "DEFAULT_QUANTIZATION": default_quantization,
+                "LLAMA_CTX": llama_ctx,
+                "DRIP_INTERVAL": drip_interval,
+                "DRIP_TOKEN": drip_token,
             }
+            if request_timeout:
+                updates["REQUEST_TIMEOUT"] = request_timeout
             if endpoint_id:
                 updates["RUNPOD_ENDPOINT_ID"] = endpoint_id
 
