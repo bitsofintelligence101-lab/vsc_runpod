@@ -1,4 +1,4 @@
-# llama.cpp · RunPod Serverless
+# llama.cpp · RunPod · VS Code Copilot
 
 Run a RunPod Hosted Model and use it as a local Ollama provider in Visual Studio Code Copilot.
 
