@@ -91,3 +91,7 @@ If you need different scaling/cost behavior, log in to the RunPod GUI after depl
 
 # Advanced: 
 This repo is currently hardcoded to the Q8 version of Qwen3.6-27B-uncensored-heretic-v2 model, but you can modify the dockerfile and proxy script to use any model you like (see make_your_own/README.md). You'd need to make the docker image, deploy it to docker hub and make sure the model files are included in the image or downloaded on startup from an accessible endpoint. Then you can change the `MODEL_ALIAS` and `DEFAULT_QUANTIZATION` variables in `.env` to point to your new model. Make sure to also update the `MODEL_NAME` variable in the proxy script to match the new model name and quantization tag.  If I get around to it i'll make this more plug-and-play in the future but for now it's a bit of a manual process to change models. Or drop the make_your_own files in to an LLM and it can tell you how to modify the dockerfile and proxy script to use a different model.
+
+# To do:
+- configure to use load balaned endpoints. this will allow actually allow parallelism to be taken advantage of.  currently it uses queue based, so one gpu can only manage. with load balanced multiple requests go to the same worker which brings down aggragate cost per token when multiple parallel requests are being made.
+https://docs.runpod.io/serverless/load-balancing/overview
