@@ -1,14 +1,14 @@
-# llama.cpp · RunPod · VS Code Copilot
+# llama.cpp · runpod · VS Code Copilot
 
-Run a RunPod Hosted Model and use it as a local Ollama provider in Visual Studio Code Copilot.
+Run a runpod Hosted Model and use it as a local Ollama provider in Visual Studio Code Copilot.
 
 ---
 
-## 1 · Create a RunPod account and get API key
+## 1 · Create a runpod account and get API key
 [Get Started with API Keys](https://docs.runpod.io/get-started/api-keys)
 
 If you don't have a runpod account yet, use this link:
-[New Runpod Account](https://runpod.io?ref=0tg2p4r0)
+[New runpod Account](https://runpod.io?ref=0tg2p4r0)
 it gives us both $10 in free credits:
 
 ## 2 · Clone the repo
