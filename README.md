@@ -20,14 +20,15 @@ cd vsc_runpod
 
 ---
 
-## 3 · Start here: run the deploy script
+## 3 · Run the deploy script
 run the deploy script:
 
 ```bash
 python3 runpod_deploy.py
 ```
 # DONE
-You should see the endpoint configuration printed in the terminal, the local proxy should be running. You can skip to step 4 to connect VS Code Copilot now, or read on for more details about how the deployment works and how to use the proxy directly if you want.
+You should see the endpoint configuration printed in the terminal, the local proxy should be running. 
+You can skip to step 4 to connect your endpoint to VS Code Copilot now, or read on for more details about how the deployment works and how to use the proxy directly if you want.
 
 ## More details on what the deploy script does:
 
