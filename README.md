@@ -58,10 +58,15 @@ Then in VS Code: **Settings → GitHub Copilot: Local Provider → Ollama** (`lo
 [![Watch how to connect the server to Visual Studio Code](https://img.youtube.com/vi/agnECMF3nVs/hqdefault.jpg)](https://youtu.be/agnECMF3nVs)
 
 ---
+## NOTES ON RUNPOD: Brittle
+RunPod's API and serverless environment are powerful but can be a bit brittle. If you encounter issues, the first step is usually to check the RunPod dashboard for any error logs or status messages related to your endpoint. Common issues include:
+- **Worker Fails to Start:** This can happen if the model fails to load due to insufficient VRAM or other resource constraints. Check the endpoint logs for any error messages during startup.
+- **Available GPU Types Change:** RunPod occasionally updates their available GPU types, which can affect your endpoint configuration. If your endpoint fails to start, verify that the selected GPU type is still available and compatible with your model's VRAM requirements.
+- **Time of Day Variability:** RunPod's performance can vary based on the time of day and overall demand. If you experience slow response times or worker startup, it may be worth trying again during off-peak hours.
 
 ## OPTIONAL: Browser Chat UI
 
-Open `chat.html` directly in your browser (no server needed). Enter your RunPod API key and Endpoint ID in the config bar at the top and click **Save**. Supports streaming text and image attachments (vision). Your config is persisted in `localStorage` between sessions.
+go to the  `chat` endpoint directly in your browser http://localhost:11434/chat. It should populate with your runpod endpoint and API key. Supports streaming text and image attachments (vision). Your config is persisted in `localStorage` between sessions.
 
 The chat UI calls `https://api.runpod.ai/v2/<ENDPOINT_ID>/openai/v1/chat/completions` directly from the browser — no proxy required.
 
