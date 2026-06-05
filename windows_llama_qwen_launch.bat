@@ -11,7 +11,7 @@ cd /d "%~dp0"
 ::   Q4_K (~16 GB):   64576 is typically safe
 :: -------------------------------------------------------
 set MODEL_QUANT=Q8_0
-set MODEL_CTX_SIZE=80000
+set MODEL_CTX_SIZE=120000
 
 :: -------------------------------------------------------
 :: HUGGING FACE CACHE: Set your preferred cache directory

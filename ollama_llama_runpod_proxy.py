@@ -122,13 +122,16 @@ def endpoint_id_from_base_or_endpoint(endpoint_or_base):
     if not value:
         return ""
     if value.startswith("http://") or value.startswith("https://"):
-        parts = [p for p in urllib.parse.urlparse(value).path.split("/") if p]
-        try:
-            i = parts.index("v2")
-            if i + 1 < len(parts):
-                return parts[i + 1]
-        except ValueError:
-            return ""
+        parsed = urllib.parse.urlparse(value)
+        host = (parsed.hostname or "").lower()
+        if host and host.endswith("runpod.ai"):
+            parts = [p for p in parsed.path.split("/") if p]
+            try:
+                i = parts.index("v2")
+                if i + 1 < len(parts):
+                    return parts[i + 1]
+            except ValueError:
+                return ""
         return ""
     return value
 
@@ -446,7 +449,14 @@ def purge_runpod_queue(reason="timeout"):
 
 
 def forward_to_runpod(path, body):
-    """Non-streaming POST to RunPod's OpenAI endpoint -> (status_code, response_text)."""
+    """
+    Non-streaming POST to RunPod's OpenAI endpoint -> (status_code, response_text).
+
+    Applies the context guard before forwarding.  If messages were truncated,
+    prepends TRUNCATION_ALERT to the first choice's message content in the
+    returned JSON so the caller sees the warning inline.
+    """
+    body, was_truncated = apply_context_guard(body)
     url = f"{RUNPOD_BASE}{path}"
     data = json.dumps(body).encode()
     print(f"[proxy] -> RunPod POST {url}  (non-stream)")
@@ -456,12 +466,34 @@ def forward_to_runpod(path, body):
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             text = resp.read().decode()
             print(f"[proxy] <- RunPod {resp.status}  response: {text[:300]}")
+            if was_truncated and resp.status == 200:
+                text = _inject_truncation_alert(text)
             return resp.status, text
     except urllib.error.HTTPError as e:
         text = e.read().decode(errors="ignore")
         print(f"[proxy] <- RunPod HTTPError {e.code}: {text[:300]}")
         return e.code, text
 
+
+def _inject_truncation_alert(response_text):
+    """
+    Prepend TRUNCATION_ALERT to the content of the first choice in a
+    non-streaming OpenAI chat completion JSON response.
+    Returns the (possibly modified) JSON string.
+    """
+    try:
+        obj = json.loads(response_text)
+        choices = obj.get("choices")
+        if choices and isinstance(choices, list):
+            msg = choices[0].get("message", {})
+            if isinstance(msg.get("content"), str):
+                msg["content"] = TRUNCATION_ALERT.lstrip() + "\n\n" + msg["content"]
+                choices[0]["message"] = msg
+                obj["choices"] = choices
+                return json.dumps(obj)
+    except Exception:
+        pass
+    return response_text
 
 def _sse(obj):
     """Serialize a dict as one SSE event."""
@@ -479,22 +511,171 @@ def _chunk(model, cid, delta=None, finish=None):
     }
 
 
+# ---------------------------------------------------------------------------
+# Context-window guard: estimate token count, truncate if needed
+# ---------------------------------------------------------------------------
+# Token budget: we leave CONTEXT_HEADROOM tokens free for the model to
+# generate into. If the estimated prompt size is within that headroom of
+# CONTEXT_LEN, we start dropping old messages.
+CONTEXT_HEADROOM = int(os.environ.get("CONTEXT_HEADROOM", "2048"))
+
+# Rough token estimator: ~4 chars per token plus per-message overhead.
+# Good enough for a safety check without importing tiktoken.
+_MSG_OVERHEAD = 4   # role + formatting tokens per message
+
+def _estimate_tokens(messages):
+    """Estimate total prompt tokens for a messages list."""
+    total = 0
+    for msg in messages:
+        total += _MSG_OVERHEAD
+        content = msg.get("content") or ""
+        if isinstance(content, str):
+            total += max(1, len(content) // 4)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    total += max(1, len(part.get("text", "")) // 4)
+        # tool_calls field
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            total += max(1, len(json.dumps(fn)) // 4)
+        # tool result content
+        if msg.get("role") == "tool":
+            total += max(1, len(str(msg.get("content", ""))) // 4)
+    return total
+
+
+def _is_tool_related(msg):
+    """Return True for messages we must never drop (tool calls / tool results)."""
+    role = msg.get("role", "")
+    if role == "tool":
+        return True
+    if role == "assistant" and msg.get("tool_calls"):
+        return True
+    return False
+
+
+def truncate_messages_for_context(messages, ctx_len=None, headroom=None):
+    """
+    If the estimated token count of *messages* is within *headroom* tokens of
+    *ctx_len*, drop old non-tool user/assistant turns (oldest first) until the
+    budget is comfortable.  Returns (truncated_messages, was_truncated).
+
+    Preservation rules (never dropped):
+      • The first message if it is a system message.
+      • Any assistant message that contains tool_calls.
+      • Any message with role == "tool" (tool results).
+      • The very last message (the current user turn).
+    """
+    if ctx_len is None:
+        ctx_len = CONTEXT_LEN
+    if headroom is None:
+        headroom = CONTEXT_HEADROOM
+
+    budget = ctx_len - headroom
+
+    if _estimate_tokens(messages) <= budget:
+        return messages, False
+
+    # Split out the system message (always kept at front).
+    if messages and messages[0].get("role") == "system":
+        system_msgs = [messages[0]]
+        body_msgs   = list(messages[1:])
+    else:
+        system_msgs = []
+        body_msgs   = list(messages)
+
+    # The final message is always kept.
+    if not body_msgs:
+        return messages, False
+
+    last_msg   = body_msgs[-1]
+    mid_msgs   = body_msgs[:-1]
+
+    # Build a list of (index, message) for droppable turns.
+    # Droppable = not tool-related. We drop oldest first.
+    droppable_indices = [
+        i for i, m in enumerate(mid_msgs) if not _is_tool_related(m)
+    ]
+
+    dropped = False
+    for idx in droppable_indices:
+        mid_msgs[idx] = None          # mark as dropped
+        dropped = True
+        remaining = [m for m in mid_msgs if m is not None]
+        candidate = system_msgs + remaining + [last_msg]
+        if _estimate_tokens(candidate) <= budget:
+            break
+
+    trimmed = system_msgs + [m for m in mid_msgs if m is not None] + [last_msg]
+
+    # Edge case: even after dropping everything droppable we're still over —
+    # return what we have (truncate_prompt_tokens on the server side will handle
+    # the rest, or it will fail gracefully).
+    return trimmed, dropped
+
+
+TRUNCATION_ALERT = (
+    "\n\n⚠️ **Alert:** The context window was close to capacity and old "
+    "conversation turns were truncated prior to responding."
+)
+
+
+def apply_context_guard(body):
+    """
+    Check messages in *body* for context overflow risk and truncate if needed.
+    Returns (new_body, was_truncated).  *body* is not mutated.
+    """
+    messages = body.get("messages")
+    if not messages:
+        return body, False
+
+    trimmed, truncated = truncate_messages_for_context(messages)
+    if not truncated:
+        return body, False
+
+    new_body = dict(body)
+    new_body["messages"] = trimmed
+    dropped = len(messages) - len(trimmed)
+    print(f"[proxy] context guard: dropped {dropped} message(s) to fit context window "
+          f"(estimated {_estimate_tokens(messages)} → {_estimate_tokens(trimmed)} tokens)")
+    return new_body, True
+
+
 def forward_stream_to_runpod(path, body, wfile):
     """
     Stream from RunPod's OpenAI endpoint to the client.
+
+    Before forwarding, checks whether the messages list is close to the context
+    window limit (within CONTEXT_HEADROOM tokens). If so, drops old non-tool
+    user/assistant turns and prepends a truncation-alert chunk in the stream.
 
     If the upstream request produces no bytes within FIRST_BYTE_TIMEOUT seconds,
     purge the RunPod queue, retry, and do that up to
     INITIAL_INCOMPLETE_READ_RETRIES times before surfacing failure.
     """
+    body, was_truncated = apply_context_guard(body)
     url = f"{RUNPOD_BASE}{path}"
     data = json.dumps(body).encode()
     model = body.get("model", MODEL_NAME)
     cid = f"chatcmpl-proxy-{next(_chunk_id_counter)}"
     print(f"[proxy] -> RunPod POST {url}  (streaming, first-byte timeout {FIRST_BYTE_TIMEOUT}s)")
     print(f"[proxy]    body: {json.dumps(body)[:300]}")
-
     def start_reader(q, stop):
+        def _read_http_error_body(error):
+            body_reader = getattr(error, "read", None)
+            if not callable(body_reader):
+                return ""
+            try:
+                data = body_reader()
+            except Exception:
+                return ""
+            if not data:
+                return ""
+            if isinstance(data, bytes):
+                return data.decode(errors="ignore")
+            return str(data)
+
         def reader():
             req = urllib.request.Request(url, data=data, headers=_runpod_headers(), method="POST")
             tracked_resp = None
@@ -517,7 +698,11 @@ def forward_stream_to_runpod(path, body, wfile):
                     q.put(("error", str(e)))
             except urllib.error.HTTPError as e:
                 if not SHUTDOWN_EVENT.is_set():
-                    q.put(("error", f"HTTP {e.code}: {e.read().decode(errors='ignore')[:500]}"))
+                    error_body = _read_http_error_body(e)
+                    if error_body:
+                        q.put(("error", f"HTTP {e.code}: {error_body[:500]}"))
+                    else:
+                        q.put(("error", f"HTTP {e.code}"))
             except (socket.timeout, TimeoutError, urllib.error.URLError) as e:
                 if not SHUTDOWN_EVENT.is_set():
                     q.put(("timeout", str(e)))
@@ -557,6 +742,11 @@ def forward_stream_to_runpod(path, body, wfile):
     # 1. immediate role chunk -> client sees 'choices' instantly
     if not safe_write(_sse(_chunk(model, cid, delta={"role": "assistant", "content": ""}))):
         return
+
+    # 1b. if context was truncated, prepend the alert as the first content chunk
+    if was_truncated:
+        if not safe_write(_sse(_chunk(model, cid, delta={"content": TRUNCATION_ALERT}))):
+            return
 
     stream_stop = threading.Event()
     real_started = False
