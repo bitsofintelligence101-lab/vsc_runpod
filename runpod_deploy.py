@@ -367,7 +367,63 @@ def save_config(endpoint_id: str) -> None:
     print(f"    RUNPOD_OPENAI_BASE={openai_base}")
 
 
-def launch_proxy_server() -> None:
+def check_local_llama() -> bool:
+    """
+    Check whether a llama.cpp server is running on localhost:8080.
+
+    llama.cpp exposes an OpenAI-compatible API at /v1/models by default.
+    A successful GET means the local instance is ready to use.
+    """
+    try:
+        resp = requests.get(
+            "http://localhost:8080/v1/models",
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        models = data.get("data", [])
+        print(f"  Local llama.cpp instance found on port 8080")
+        if models:
+            print(f"  Available model(s): {[m.get('id', '?') for m in models]}")
+        return True
+    except requests.ConnectionError:
+        return False
+    except requests.Timeout:
+        print("  Local llama.cpp on port 8080 timed out (is it still starting up?)")
+        return False
+    except Exception as exc:
+        print(f"  Error checking localhost:8080: {exc}")
+        return False
+
+
+def launch_proxy_local() -> None:
+    """
+    Start the proxy server pointing to the local llama.cpp instance instead
+    of a RunPod endpoint.
+
+    We set RUNPOD_BASE to localhost:8080 so the proxy treats it as the
+    OpenAI-compatible backend.  No API key is needed for local mode.
+    """
+    # Temporarily override env so the proxy targets localhost:8080
+    os.environ["RUNPOD_BASE"] = "http://localhost:8080"
+    os.environ["RUNPOD_OPENAI_BASE"] = "http://localhost:8080/v1"
+
+    proxy_script = os.path.join(os.path.dirname(__file__), "ollama_llama_runpod_proxy.py")
+    print("\nLaunching proxy server (local llama.cpp mode)...")
+    print(f"  {sys.executable} {proxy_script}")
+    print(f"  Target: http://localhost:8080")
+    proc = subprocess.Popen([sys.executable, proxy_script])
+    print("  Proxy server started.  Press Ctrl+C to stop.\n")
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def launch_proxy() -> None:
     """Start the local Ollama-compatible proxy in the current console.
 
     Blocks until the proxy exits so that Ctrl+C in the terminal propagates to
@@ -394,6 +450,27 @@ def launch_proxy_server() -> None:
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # ── 0. ask whether to use local llama.cpp ────────────────────────────────
+    use_local = input(
+        "Before launching Runpod, do you want to proxy to a local llama.cpp instance instead? [y/N]: "
+    ).strip().lower()
+
+    if use_local in ("y", "yes"):
+        if check_local_llama():
+            print("\nUsing local llama.cpp instance.\n")
+            launch_proxy_local()
+            return
+        else:
+            print("No llama instance found on localhost:8080.")
+            use_runpod = input(
+                "Should I launch a RunPod connection instead? [Y/n]: "
+            ).strip().lower()
+            if use_runpod not in ("n", "no"):
+                pass  # fall through to the RunPod flow below
+            else:
+                print("\nExiting. Start llama.cpp on port 8080 and try again.")
+                return
+
     # ── 1. resolve API key (prompt + save to .env on first run) ─────────────
     api_key = resolve_api_key()
 
@@ -414,7 +491,7 @@ def main() -> None:
             f"A RunPod endpoint exists (id={existing_endpoint_id}), launching proxy server using it.\n"
             "Delete the RUNPOD_ENDPOINT_ID line from .env if you want to reset."
         )
-        launch_proxy_server()
+        launch_proxy()
         return
 
     print("=== RunPod Serverless Deployer ===\n")
@@ -454,7 +531,7 @@ Now start the proxy:
         "Do you want to launch the proxy server now so you can use the endpoint in Visual Studio Code? [y/N]: "
     ).strip().lower()
     if launch_now in ("y", "yes"):
-        launch_proxy_server()
+        launch_proxy()
     else:
         print("\nYou can run it later by running this script or the ollama_llama_runpod_proxy.py script directly.")
 

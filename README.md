@@ -26,6 +26,9 @@ run the deploy script:
 ```bash
 python3 runpod_deploy.py
 ```
+
+You'll be asked **Do you want to use a local llama model instead?** — answer `no` (or just press Enter) to proceed with the RunPod deployment.
+
 # DONE
 You should see the endpoint configuration printed in the terminal, the local proxy should be running. 
 You can skip to step 4 to connect your endpoint to VS Code Copilot now, or read on for more details about how the deployment works and how to use the proxy directly if you want.
@@ -98,6 +101,10 @@ for chunk in resp:
 ```
 
 If you need different scaling/cost behavior, log in to the RunPod GUI after deployment and edit endpoint settings there.
+
+# OPTIONAL: Run the model locally (Windows)
+
+A `windows_llama_qwen_launch.bat` file is included for Windows users who want to run the same Qwen3.6-27B model locally instead of using RunPod. Just double-click it (or run it from PowerShell) to start the local model server. Once it's running, you can then run `python3 runpod_deploy.py` (answer `yes` when asked about using a local model) to have the proxy connect to your local instance instead.
 
 # OPTIONAL: Model Download
 **Network Volume (one-time setup):** A 27B Q8_0 model is ~29 GB. Create a Network Volume, mount it to a temporary Pod, and run `./download_models.sh` once. The serverless worker mounts it at `/runpod-volume` on every start — no re-downloading.

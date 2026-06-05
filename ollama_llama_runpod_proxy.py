@@ -987,7 +987,11 @@ if __name__ == "__main__":
     print("=" * 60)
     print("NOTE on first deployment or deployment after a long idle period:")
     print("If you have just deployed the model on runpod, you need to wait about 10 minutes for the first cold start")
-    print("if you get error in visual studo code like \n'............[proxy: upstream error] IncompleteRead(0 bytes read)'\n it's not ready yet, wait and try again in about 5 minutes\nthe server is still probably downloading the large model files")
+    print("if you get error in visual studo code like \n'............[proxy: upstream error] IncompleteRead(0 bytes read)'")
+    print("or a message in vs code like 'Sorry, your request failed. Please try again.....")
+    print("\n it's not ready yet, wait and try again in about 5 minutes\nthe server is still probably downloading the large model files")
+    print("\nGo to your serverless endpoint (NOT the worker itself) on RunPod and check the logs to see when the model is loaded and ready to serve requests.")
+    print("=" * 60)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
