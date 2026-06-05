@@ -691,11 +691,16 @@ def forward_stream_to_runpod(path, body, wfile):
                             break
                         q.put(("bytes", chunk))
             except http.client.IncompleteRead as e:
-                partial = getattr(e, "partial", b"") or b""
-                if partial:
-                    q.put(("bytes", partial))
-                elif not SHUTDOWN_EVENT.is_set():
-                    q.put(("error", str(e)))
+                # stop.is_set() means _close_active_upstreams() interrupted the read
+                # mid-stream as part of a deliberate retry/shutdown — not a real error.
+                if stop.is_set() or SHUTDOWN_EVENT.is_set():
+                    pass
+                else:
+                    partial = getattr(e, "partial", b"") or b""
+                    if partial:
+                        q.put(("bytes", partial))
+                    else:
+                        q.put(("error", str(e)))
             except urllib.error.HTTPError as e:
                 if not SHUTDOWN_EVENT.is_set():
                     error_body = _read_http_error_body(e)
@@ -707,7 +712,13 @@ def forward_stream_to_runpod(path, body, wfile):
                 if not SHUTDOWN_EVENT.is_set():
                     q.put(("timeout", str(e)))
             except Exception as e:  # noqa: BLE001 — surface any upstream failure to the client
-                if not SHUTDOWN_EVENT.is_set():
+                # Suppress errors caused by deliberate connection closure
+                # (_close_active_upstreams sets stop and forcibly closes resp,
+                # which makes the blocked resp.read() raise AttributeError /
+                # OSError / RemoteDisconnected with NoneType internals).
+                if stop.is_set() or SHUTDOWN_EVENT.is_set():
+                    pass
+                else:
                     q.put(("error", str(e)))
             finally:
                 if tracked_resp is not None:
@@ -739,6 +750,9 @@ def forward_stream_to_runpod(path, body, wfile):
             return "upstream closed before sending any bytes"
         return payload
 
+    # stream_stop must exist before any safe_write call (safe_write references it)
+    stream_stop = threading.Event()
+
     # 1. immediate role chunk -> client sees 'choices' instantly
     if not safe_write(_sse(_chunk(model, cid, delta={"role": "assistant", "content": ""}))):
         return
@@ -748,7 +762,6 @@ def forward_stream_to_runpod(path, body, wfile):
         if not safe_write(_sse(_chunk(model, cid, delta={"content": TRUNCATION_ALERT}))):
             return
 
-    stream_stop = threading.Event()
     real_started = False
     final_error = ""
     try:
