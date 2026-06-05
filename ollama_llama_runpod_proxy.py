@@ -39,7 +39,183 @@ import socket
 import urllib.request
 import urllib.error
 import urllib.parse
+import logging
+import sys
+import re
+import base64
 from datetime import datetime
+
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+# LOG_LEVEL : DEBUG | INFO | WARNING | ERROR  (default INFO)
+# LOG_FILE  : path to write logs in addition to stderr (optional)
+#
+# Message / tool-call tracing is at DEBUG level so it never clutters normal
+# operation but is always there when you need it.
+# ---------------------------------------------------------------------------
+_LOG_LEVEL_NAME = os.environ.get("LOG_LEVEL", "INFO").upper()
+_LOG_LEVEL = getattr(logging, _LOG_LEVEL_NAME, logging.INFO)
+
+_log_fmt = logging.Formatter(
+    fmt="%(asctime)s.%(msecs)03d  %(levelname)-7s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+_handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+_log_file_path = os.environ.get("LOG_FILE", "")
+if _log_file_path:
+    _fh = logging.FileHandler(_log_file_path, encoding="utf-8")
+    _fh.setFormatter(_log_fmt)
+    _handlers.append(_fh)
+
+for _h in _handlers:
+    _h.setFormatter(_log_fmt)
+
+log = logging.getLogger("proxy")
+log.setLevel(_LOG_LEVEL)
+for _h in _handlers:
+    log.addHandler(_h)
+log.propagate = False   # don't double-print via root logger
+
+# Silence the noisy default BaseHTTPRequestHandler access log
+logging.getLogger("http.server").setLevel(logging.WARNING)
+
+# ---------------------------------------------------------------------------
+# Message / tool-call formatting helpers  (used by DEBUG tracing)
+# ---------------------------------------------------------------------------
+# Maximum chars of raw content shown inline before truncation.
+_CONTENT_INLINE_MAX = int(os.environ.get("LOG_CONTENT_MAX", "200"))
+# For base64 / file data: show this many chars of head and tail.
+_B64_HEAD = int(os.environ.get("LOG_B64_HEAD", "50"))
+_B64_TAIL = int(os.environ.get("LOG_B64_TAIL", "50"))
+
+# Regex: looks like base64 if >= 100 chars of [A-Za-z0-9+/=]
+_B64_RE = re.compile(r'^[A-Za-z0-9+/=\r\n]{100,}$')
+
+
+def _truncate_data(value: str) -> str:
+    """Return a display-safe version of a potentially large / binary string."""
+    v = value.strip()
+    if len(v) <= _CONTENT_INLINE_MAX:
+        return v
+    # Looks like base64 / file data → show head...tail
+    if _B64_RE.match(v.replace("\n", "").replace("\r", "")):
+        return f"{v[:_B64_HEAD]}…[{len(v)} chars]…{v[-_B64_TAIL:]}"
+    # Plain text that is just long
+    return f"{v[:_CONTENT_INLINE_MAX]}…[{len(v)} chars total]"
+
+
+def _fmt_content(content) -> str:
+    """Render a message content field (str or list) for log output."""
+    if content is None:
+        return "<null>"
+    if isinstance(content, str):
+        return _truncate_data(content)
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                parts.append(str(part))
+                continue
+            ptype = part.get("type", "?")
+            if ptype == "text":
+                parts.append(f"[text] {_truncate_data(part.get('text',''))}")
+            elif ptype == "image_url":
+                url = part.get("image_url", {}).get("url", "")
+                if url.startswith("data:"):
+                    # data URI — show media type + truncated data
+                    header, _, data = url.partition(",")
+                    parts.append(f"[image_url] {header},{_truncate_data(data)}")
+                else:
+                    parts.append(f"[image_url] {url}")
+            elif ptype in ("image", "document"):
+                src = part.get("source", {})
+                media = src.get("media_type", "?")
+                data = src.get("data", "")
+                parts.append(f"[{ptype}/{media}] {_truncate_data(str(data))}")
+            else:
+                parts.append(f"[{ptype}] {_truncate_data(json.dumps(part))}")
+        return " | ".join(parts)
+    return _truncate_data(json.dumps(content))
+
+
+def _fmt_tool_calls(tool_calls: list) -> str:
+    """Render a list of tool_calls for log output."""
+    lines = []
+    for tc in tool_calls or []:
+        fn = tc.get("function", {})
+        name = fn.get("name", "?")
+        raw_args = fn.get("arguments", "{}")
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            args_str = json.dumps(args, separators=(",", ":"))
+        except Exception:
+            args_str = str(raw_args)
+        lines.append(f"  call id={tc.get('id','?')}  fn={name}  args={_truncate_data(args_str)}")
+    return "\n".join(lines) if lines else "  (none)"
+
+
+def log_messages(messages: list, label: str = "MESSAGES →") -> None:
+    """Emit a DEBUG-level structured dump of a messages list."""
+    if not log.isEnabledFor(logging.DEBUG):
+        return
+    lines = [f"{label}  ({len(messages)} messages, ~{_estimate_tokens(messages)} est. tokens)"]
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "?")
+        name = f" name={msg['name']}" if msg.get("name") else ""
+        tool_id = f" tool_call_id={msg['tool_call_id']}" if msg.get("tool_call_id") else ""
+        header = f"  [{i:02d}] role={role}{name}{tool_id}"
+        content = msg.get("content")
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            lines.append(f"{header}  [HAS TOOL_CALLS]")
+            lines.append(_fmt_tool_calls(tool_calls))
+            if content:
+                lines.append(f"       content: {_fmt_content(content)}")
+        elif role == "tool":
+            lines.append(f"{header}  result: {_fmt_content(content)}")
+        else:
+            lines.append(f"{header}  {_fmt_content(content)}")
+    log.debug("\n".join(lines))
+
+
+def log_response_chunk(chunk_text: str, label: str = "← RESPONSE CHUNK") -> None:
+    """Emit a DEBUG-level log for an SSE chunk or non-stream response body."""
+    if not log.isEnabledFor(logging.DEBUG):
+        return
+    try:
+        obj = json.loads(chunk_text.strip().removeprefix("data:").strip())
+    except Exception:
+        log.debug(f"{label}: {_truncate_data(chunk_text)}")
+        return
+    choices = obj.get("choices", [])
+    if not choices:
+        log.debug(f"{label}: (no choices)  raw={_truncate_data(chunk_text)}")
+        return
+    c = choices[0]
+    # streaming delta
+    delta = c.get("delta", {})
+    finish = c.get("finish_reason")
+    if delta.get("tool_calls"):
+        tcs = delta["tool_calls"]
+        for tc in tcs:
+            fn = tc.get("function", {})
+            idx = tc.get("index", "?")
+            log.debug(f"{label}: [tool_call delta idx={idx}] fn={fn.get('name','')} "
+                      f"args_chunk={_truncate_data(fn.get('arguments',''))}")
+    elif delta.get("content") is not None:
+        log.debug(f"{label}: [content delta] {_truncate_data(delta['content'])}")
+    elif finish:
+        # non-streaming message
+        msg = c.get("message", {})
+        role = msg.get("role", "?")
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            log.debug(f"{label}: [finish={finish}] role={role} TOOL_CALLS:\n{_fmt_tool_calls(tool_calls)}")
+        else:
+            log.debug(f"{label}: [finish={finish}] role={role} {_fmt_content(msg.get('content'))}")
 
 
 ENV_FILE = ".env"
@@ -69,7 +245,7 @@ def load_dotenv_file(path=ENV_FILE):
                     continue
                 os.environ[key] = _strip_quotes(value)
     except Exception as e:
-        print(f"[proxy] warning: failed reading {path}: {e}")
+        log.warning("Failed reading %s: %s", {path}, {e})
 
 
 def _quote_env_value(value):
@@ -228,7 +404,7 @@ def config_page_html(message="", error=False):
                 <div class=\"hint\">Combined with the model alias to form the Ollama-visible model tag.</div>
 
                 <label for=\"llama_ctx\">LLAMA_CTX</label>
-                <input id=\"llama_ctx\" name=\"llama_ctx\" value=\"{context_value}\" placeholder=\"64000\" />
+                <input id=\"llama_ctx\" name=\"llama_ctx\" value=\"{context_value}\" placeholder=\"52000\" />
                 <div class=\"hint\">Context length advertised in local metadata responses.</div>
 
                 <label for=\"request_timeout\">REQUEST_TIMEOUT</label>
@@ -320,7 +496,7 @@ RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 MODEL_ALIAS         = os.environ.get("MODEL_ALIAS", "Qwen3.6-27B-Q8-heretic-v2")
 DEFAULT_QUANTIZATION = os.environ.get("DEFAULT_QUANTIZATION", "Q8_0")
 MODEL_NAME          = f"{MODEL_ALIAS}:{DEFAULT_QUANTIZATION}"   # Ollama needs 'name:tag'
-CONTEXT_LEN         = int(os.environ.get("LLAMA_CTX", "64000"))
+CONTEXT_LEN         = int(os.environ.get("LLAMA_CTX", "52000"))
 
 # No request timeout by default: the first call may trigger a cold start (model
 # load) that takes a while. Set REQUEST_TIMEOUT (seconds) to cap it if you prefer.
@@ -393,20 +569,20 @@ def shutdown_server(server, reason="shutdown requested"):
 
     _shutdown_started.set()
     SHUTDOWN_EVENT.set()
-    print(f"[proxy] initiating shutdown ({reason})")
+    log.info("Initiating shutdown (%s)", {reason})
     _close_active_upstreams()
 
     try:
         server.shutdown()
     except Exception as e:
-        print(f"[proxy] shutdown() warning: {e}")
+        log.warning("shutdown() warning: %s", {e})
 
     try:
         server.server_close()
     except Exception as e:
-        print(f"[proxy] server_close() warning: {e}")
+        log.warning("server_close() warning: %s", {e})
 
-    print("[proxy] shutdown complete")
+    log.info("Shutdown complete")
 
 
 def get_model_info():
@@ -432,19 +608,19 @@ def purge_runpod_queue(reason="timeout"):
     """Best-effort full queue clear for the active RunPod endpoint."""
     control_base = _runpod_control_base()
     if not control_base:
-        print(f"[proxy] queue purge skipped ({reason}): endpoint id unavailable")
+        log.warning("Queue purge skipped (%s): endpoint id unavailable", {reason})
         return False
 
     url = f"{control_base}/purge-queue"
     req = urllib.request.Request(url, data=b"{}", headers=_runpod_headers(), method="POST")
-    print(f"[proxy] -> RunPod POST {url}  (purge queue, reason={reason})")
+    log.info("→ POST %s  (purge queue, reason=%s)", url, {reason})
     try:
         with urllib.request.urlopen(req, timeout=QUEUE_PURGE_TIMEOUT) as resp:
             body = resp.read().decode(errors="ignore")
-            print(f"[proxy] <- RunPod {resp.status}  purge response: {body[:300]}")
+            log.info("← %s  purge response: %s", resp.status, body[:300])
             return True
     except Exception as e:  # noqa: BLE001 - queue purge is best effort
-        print(f"[proxy] queue purge failed ({reason}): {e}")
+        log.warning("Queue purge failed (%s): %s", {reason}, {e})
         return False
 
 
@@ -459,19 +635,21 @@ def forward_to_runpod(path, body):
     body, was_truncated = apply_context_guard(body)
     url = f"{RUNPOD_BASE}{path}"
     data = json.dumps(body).encode()
-    print(f"[proxy] -> RunPod POST {url}  (non-stream)")
-    print(f"[proxy]    body: {json.dumps(body)[:300]}")
+    log.info("→ POST %s  (non-stream)", url)
+    log.debug("  request body (first 300): %s", json.dumps(body)[:300])
+    log_messages(body.get("messages", []), label="→ MESSAGES (non-stream)")
     req = urllib.request.Request(url, data=data, headers=_runpod_headers(), method="POST")
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             text = resp.read().decode()
-            print(f"[proxy] <- RunPod {resp.status}  response: {text[:300]}")
+            log.info("← %s  response (first 300): %s", resp.status, text[:300])
+            log_response_chunk(text, label="← RESPONSE (non-stream)")
             if was_truncated and resp.status == 200:
                 text = _inject_truncation_alert(text)
             return resp.status, text
     except urllib.error.HTTPError as e:
         text = e.read().decode(errors="ignore")
-        print(f"[proxy] <- RunPod HTTPError {e.code}: {text[:300]}")
+        log.error("← HTTP error %s: %s", e.code, text[:300])
         return e.code, text
 
 
@@ -637,8 +815,8 @@ def apply_context_guard(body):
     new_body = dict(body)
     new_body["messages"] = trimmed
     dropped = len(messages) - len(trimmed)
-    print(f"[proxy] context guard: dropped {dropped} message(s) to fit context window "
-          f"(estimated {_estimate_tokens(messages)} → {_estimate_tokens(trimmed)} tokens)")
+    log.warning("Context guard: dropped %s message(s) — estimated %s → %s tokens",
+               dropped, _estimate_tokens(messages), _estimate_tokens(trimmed))
     return new_body, True
 
 
@@ -659,8 +837,9 @@ def forward_stream_to_runpod(path, body, wfile):
     data = json.dumps(body).encode()
     model = body.get("model", MODEL_NAME)
     cid = f"chatcmpl-proxy-{next(_chunk_id_counter)}"
-    print(f"[proxy] -> RunPod POST {url}  (streaming, first-byte timeout {FIRST_BYTE_TIMEOUT}s)")
-    print(f"[proxy]    body: {json.dumps(body)[:300]}")
+    log.info("→ POST %s  (streaming, first-byte timeout %ss)", url, FIRST_BYTE_TIMEOUT)
+    log.debug("  request body (first 300): %s", json.dumps(body)[:300])
+    log_messages(body.get("messages", []), label="→ MESSAGES (stream)")
     def start_reader(q, stop):
         def _read_http_error_body(error):
             body_reader = getattr(error, "read", None)
@@ -745,7 +924,12 @@ def forward_stream_to_runpod(path, body, wfile):
 
     def failure_reason(kind, payload):
         if kind == "timeout":
-            return f"no upstream bytes within {FIRST_BYTE_TIMEOUT}s"
+            est = _estimate_tokens(body.get("messages", []))
+            tip = (""
+                   if est < CONTEXT_LEN * 0.6
+                   else f"  TIP: prompt is ~{est} tokens; large context = slow prefill. "
+                        f"Consider raising FIRST_BYTE_TIMEOUT (currently {FIRST_BYTE_TIMEOUT}s).")
+            return f"no upstream bytes within {FIRST_BYTE_TIMEOUT}s{tip}"
         if kind == "done":
             return "upstream closed before sending any bytes"
         return payload
@@ -787,33 +971,42 @@ def forward_stream_to_runpod(path, body, wfile):
                     if kind == "bytes":
                         first_byte_seen = True
                         real_started = True
-                        print(f"[proxy] first real bytes on attempt {attempt_index}/{INITIAL_INCOMPLETE_READ_RETRIES}")
+                        log.info("First real bytes on attempt %s/%s", {attempt_index}, {INITIAL_INCOMPLETE_READ_RETRIES})
                         if not safe_write(payload):
                             return
                         continue
 
                     reason = failure_reason(kind, payload)
                     if attempt_index < INITIAL_INCOMPLETE_READ_RETRIES:
-                        print(f"[proxy] first-byte wait failed on attempt {attempt_index}/{INITIAL_INCOMPLETE_READ_RETRIES}: {reason}")
+                        log.warning("First-byte wait failed on attempt %s/%s: %s", {attempt_index}, {INITIAL_INCOMPLETE_READ_RETRIES}, {reason})
                         stop_current_attempt(attempt_stop)
                         purge_runpod_queue(reason=reason)
                         time.sleep(INITIAL_INCOMPLETE_READ_BACKOFF)
                         break
 
                     final_error = reason
-                    print(f"[proxy] first-byte wait failed after {attempt_index} attempt(s): {reason}")
+                    log.error("First-byte wait failed after %s attempt(s): %s", {attempt_index}, {reason})
                     stop_current_attempt(attempt_stop)
                     break
 
                 kind, payload = q.get()
                 if kind == "bytes":
+                    # Log tool-call / finish SSE chunks at DEBUG
+                    if log.isEnabledFor(logging.DEBUG):
+                        for raw_line in payload.decode(errors="ignore").splitlines():
+                            if raw_line.startswith("data:") and raw_line != "data: [DONE]":
+                                chunk_txt = raw_line[5:].strip()
+                                if ('tool_calls' in chunk_txt or
+                                        'finish_reason' in chunk_txt and
+                                        'null' not in chunk_txt):
+                                    log_response_chunk(chunk_txt, label="← SSE CHUNK")
                     if not safe_write(payload):
                         return
                 elif kind == "error":
-                    print(f"[proxy] <- RunPod error after stream start: {payload}")
+                    log.error("← Upstream error after stream start: %s", {payload})
                     break
                 elif kind == "timeout":
-                    print(f"[proxy] <- RunPod timeout after stream start: {payload}")
+                    log.warning("← Upstream timeout after stream start: %s", {payload})
                     break
                 elif kind == "done":
                     break
@@ -822,14 +1015,14 @@ def forward_stream_to_runpod(path, body, wfile):
                 break
 
         if final_error and not real_started:
-            print(f"[proxy] stream failed before first byte: {final_error}")
+            log.error("Stream failed before first byte: %s", {final_error})
     finally:
         stream_stop.set()
         _close_active_upstreams()
         # Always terminate the SSE stream. If RunPod already sent [DONE] in the
         # raw bytes, a second one is harmless (clients stop at the first).
         safe_write(b"data: [DONE]\n\n")
-        print(f"[proxy] <- stream closed (real_started={real_started})")
+        log.info("← Stream closed (real_started=%s)", {real_started})
 
 
 def responses_to_chat_completions(parsed):
@@ -870,7 +1063,7 @@ def responses_to_chat_completions(parsed):
 class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
-        print(f"[proxy] {self.command} {self.path} -> {args[0] if args else ''}")
+        log.debug("HTTP %s %s -> %s", self.command, self.path, args[0] if args else "")
 
     def send_json(self, status, payload):
         body = json.dumps(payload).encode()
@@ -914,7 +1107,7 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         model_name, quant, _ = get_model_info()
-        print(f"[proxy] GET {self.path}")
+        log.info("GET %s", {self.path})
 
         if self.path in ("/", "/api/version"):
             self.send_json(200, {"version": "0.6.4"})
@@ -948,7 +1141,7 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
             })
 
         else:
-            print(f"[proxy]   -> UNHANDLED GET '{self.path}'")
+            log.warning("Unhandled GET: %s", {self.path})
             self.send_json(404, {"error": f"Unhandled GET: {self.path}"})
 
     # ------------------------------------------------------------------
@@ -1037,9 +1230,9 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             apply_runtime_config(final_key, final_endpoint, enable_vision=enable_vision)
-            print("[proxy] configuration saved to .env")
+            log.info("Configuration saved to .env")
             if is_config_ready():
-                print("[proxy] server is ready to use with Visual Studio Code")
+                log.info("Server is ready to use with Visual Studio Code")
             send_html(self, config_page_html("Saved. Server is ready to use with Visual Studio Code."))
             return
 
@@ -1054,7 +1247,7 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             parsed = self.read_body()
             is_stream = parsed.get("stream", False)
-            print(f"[proxy] POST {self.path}  stream={is_stream}")
+            log.info("POST %s  stream=%s", {self.path}, {is_stream})
 
             # --- /api/show --- answered locally (metadata only)
             if self.path == "/api/show":
@@ -1150,11 +1343,11 @@ class OllamaProxyHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(body.encode())
 
             else:
-                print(f"[proxy]   -> UNHANDLED POST '{self.path}' body={json.dumps(parsed)[:300]}")
+                log.warning("Unhandled POST: %s  body=%s", {self.path}, {json.dumps(parsed)[:300]})
                 self.send_json(404, {"error": f"Unhandled POST: {self.path}"})
 
         except Exception as e:
-            print(f"[proxy] ERROR on {self.path}: {e}")
+            log.error("ERROR on %s: %s", {self.path}, {e})
             self.send_json(500, {"error": str(e)})
 
 
@@ -1162,39 +1355,43 @@ if __name__ == "__main__":
     server = http.server.ThreadingHTTPServer(("0.0.0.0", PROXY_PORT), OllamaProxyHandler)
     server.daemon_threads = True
 
-    print("\n", "=" * 60)
-    print("Ollama <-> RunPod Serverless proxy")
-    print("=" * 60)
+    sep = "=" * 60
+    log.info(sep)
+    log.info("Ollama <-> RunPod Serverless proxy  (log level: %s)", _LOG_LEVEL_NAME)
+    if _log_file_path:
+        log.info("  Log file: %s", _log_file_path)
+    log.info(sep)
     if not is_config_ready():
-        print("-- Proxy is NOT configured yet! --\n\n")
-        print(f"open config: http://localhost:{PROXY_PORT}/config")
-        print("Go to that local config page")
-        print("Provide RUNPOD_API_KEY and Runpodendpoint, then save.")
-        print("You won't need to restart the proxy; it picks up config changes immediately.")
-        print("\n\n------------BELOW WORKS AFTER CONFIGURATION SAVE---------------------")
+        log.warning("Proxy is NOT configured yet!")
+        log.warning("  Open config: http://localhost:%s/config", PROXY_PORT)
+        log.warning("  Provide RUNPOD_API_KEY and endpoint, then save.")
+        log.warning("  No restart needed — config is picked up immediately.")
     else:
-        print("  Server is ready to use with Visual Studio Code.")
-    print(f"  Listening (as Ollama):  http://0.0.0.0:{PROXY_PORT}")
-    print(f"  Forwarding to RunPod:    {RUNPOD_BASE}/v1/...")
-    print(f"  Auth header:             {'set' if RUNPOD_API_KEY else 'MISSING — set RUNPOD_API_KEY!'}")
-    print(f"  Browser chat UI:         http://localhost:{PROXY_PORT}/chat")
-    print(f"  Advertised model:        {MODEL_NAME}  (context {CONTEXT_LEN})")
-    print(f"  Vision capability:       {'enabled' if ENABLE_VISION else 'disabled'}")
-    print(f"  Cold-start drip:         '{DRIP_TOKEN}' every {DRIP_INTERVAL}s until real tokens")
-    
-    print()
-    print("  Metadata (GET /api/tags, /api/version, /api/show, /v1/models)")
-    print("  is answered LOCALLY and never wakes a GPU worker.")
-    print("  Only /api/chat, /api/generate, /v1/chat/completions, /v1/responses")
-    print("  are forwarded to RunPod.")
-    print("=" * 60)
-    print("NOTE on first deployment or deployment after a long idle period:")
-    print("If you have just deployed the model on runpod, you need to wait about 10 minutes for the first cold start")
-    print("if you get error in visual studo code like \n'............[proxy: upstream error] IncompleteRead(0 bytes read)'")
-    print("or a message in vs code like 'Sorry, your request failed. Please try again.....")
-    print("\n it's not ready yet, wait and try again in about 5 minutes\nthe server is still probably downloading the large model files")
-    print("\nGo to your serverless endpoint (NOT the worker itself) on RunPod and check the logs to see when the model is loaded and ready to serve requests.")
-    print("=" * 60)
+        log.info("  Server is ready to use with Visual Studio Code.")
+    log.info("  Listening (as Ollama):   http://0.0.0.0:%s", PROXY_PORT)
+    log.info("  Forwarding to:           %s/v1/...", RUNPOD_BASE)
+    log.info("  Auth header:             %s", "set" if RUNPOD_API_KEY else "MISSING — set RUNPOD_API_KEY!")
+    log.info("  Browser chat UI:         http://localhost:%s/chat", PROXY_PORT)
+    log.info("  Advertised model:        %s  (context %s)", MODEL_NAME, CONTEXT_LEN)
+    log.info("  Context headroom:        %s tokens  (truncation triggers at %s)",
+             CONTEXT_HEADROOM, CONTEXT_LEN - CONTEXT_HEADROOM)
+    log.info("  First-byte timeout:      %ss  (raise via FIRST_BYTE_TIMEOUT if prefill is slow)", FIRST_BYTE_TIMEOUT)
+    log.info("  Vision capability:       %s", "enabled" if ENABLE_VISION else "disabled")
+    log.info("  Cold-start drip:         %r every %ss until real tokens", DRIP_TOKEN, DRIP_INTERVAL)
+    log.info("  Message/tool tracing:    %s  (set LOG_LEVEL=DEBUG to enable)",
+             "ON" if log.isEnabledFor(logging.DEBUG) else "off")
+    log.info("")
+    log.info("  Metadata (GET /api/tags, /api/version, /api/show, /v1/models)")
+    log.info("  is answered LOCALLY and never wakes a GPU worker.")
+    log.info("  Only /api/chat, /api/generate, /v1/chat/completions, /v1/responses")
+    log.info("  are forwarded to RunPod.")
+    log.info(sep)
+    log.info("NOTE: On first deploy or after long idle, cold-start can take 5-10 min.")
+    log.info("  'Sorry, your request failed' / IncompleteRead → model still loading.")
+    log.info("  Check RunPod serverless endpoint logs for readiness.")
+    log.info("  If you see first-byte timeout warnings with large context, raise")
+    log.info("  FIRST_BYTE_TIMEOUT (currently %ss) to accommodate slow KV prefill.", FIRST_BYTE_TIMEOUT)
+    log.info(sep)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

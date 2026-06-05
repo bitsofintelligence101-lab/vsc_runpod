@@ -5,13 +5,22 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 :: -------------------------------------------------------
-:: CONTEXT SIZE: Adjust this based on VRAM and quantization
+:: CONTEXT SIZE: Read from .env (LLAMA_CTX) with a fallback
 ::   Q8_0 (~28.5 GB): 16384 or 24576 on a 32 GB card
 ::   Q6_K (~22 GB):   65000 is typically safe
 ::   Q4_K (~16 GB):   64576 is typically safe
 :: -------------------------------------------------------
 set MODEL_QUANT=Q8_0
+
+:: Try to load LLAMA_CTX from .env; fall back to 120000 if not found
 set MODEL_CTX_SIZE=120000
+if exist ".env" (
+    for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
+        if /i "%%A"=="LLAMA_CTX" (
+            set "MODEL_CTX_SIZE=%%~B"
+        )
+    )
+)
 
 :: -------------------------------------------------------
 :: HUGGING FACE CACHE: Set your preferred cache directory
@@ -157,7 +166,7 @@ set "CHAT_TEMPLATE={\"enable_thinking\":true}"
 ::   "1,4"  -> ~20% on 5090, ~80% on 5060
 :: Comment out or delete to use default even split.
 :: =======================================================
-set "TENSOR_SPLIT=3,1"
+set "TENSOR_SPLIT=2.6,1"
 echo Setting tensor split for multi-GPU: !TENSOR_SPLIT! (5090,5060 Ti)
 
 build\bin\llama-server.exe ^
